@@ -226,18 +226,33 @@ func (q *Query) OneWithContext(ctx aws.Context, out interface{}) error {
 	}
 
 	// If not, try a Query.
+	// Paginate through results when filter expressions remove all items
+	// from a page. Without this, One() returns ErrNotFound even though
+	// matching items exist in later pages. (See: guregu/dynamo#248)
 	req := q.queryInput()
 
 	var res *dynamodb.QueryOutput
-	err := retry(ctx, func() error {
-		var err error
-		res, err = q.table.db.client.QueryWithContext(ctx, req)
+	for {
+		err := retry(ctx, func() error {
+			var err error
+			res, err = q.table.db.client.QueryWithContext(ctx, req)
+			return err
+		})
 		if err != nil {
 			return err
+		}
+		if q.cc != nil {
+			addConsumedCapacity(q.cc, res.ConsumedCapacity)
 		}
 
 		switch {
 		case len(res.Items) == 0:
+			if res.LastEvaluatedKey != nil && q.searchLimit == 0 {
+				// Filter removed all items in this page, but more pages exist.
+				// Continue to next page.
+				req.ExclusiveStartKey = res.LastEvaluatedKey
+				continue
+			}
 			return ErrNotFound
 		case len(res.Items) > 1:
 			return ErrTooMany
@@ -245,16 +260,8 @@ func (q *Query) OneWithContext(ctx aws.Context, out interface{}) error {
 			return ErrTooMany
 		}
 
-		return nil
-	})
-	if err != nil {
-		return err
+		return unmarshalItem(res.Items[0], out)
 	}
-	if q.cc != nil {
-		addConsumedCapacity(q.cc, res.ConsumedCapacity)
-	}
-
-	return unmarshalItem(res.Items[0], out)
 }
 
 // Count executes this request, returning the number of results.
